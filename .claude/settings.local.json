@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install platformio --quiet)",
+      "PowerShell(Get-Command python -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-Command pio -ErrorAction SilentlyContinue)",
+      "PowerShell($pythonPath = \\(Get-Command python.exe\\).Source; Write-Host \"Python path: $pythonPath\"; & $pythonPath --version)"
+    ]
+  }
+}

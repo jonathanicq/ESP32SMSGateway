@@ -1,0 +1,53 @@
+services:
+  db:
+    image: mysql:8
+    container_name: sms-gateway-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: sms_gateway
+      MYSQL_USER: smsgw
+      MYSQL_PASSWORD: ${DB_PASSWORD:-changeme}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootchangeme}
+    volumes:
+      - sms_gateway_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    container_name: sms-gateway-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+      DATABASE_URL: mysql+pymysql://smsgw:${DB_PASSWORD:-changeme}@db:3306/sms_gateway
+      JWT_SECRET: ${JWT_SECRET:-replace-me}
+      SUPER_ADMIN_EMAIL: ${SUPER_ADMIN_EMAIL:-admin@thecoordinates.xyz}
+      SUPER_ADMIN_PASSWORD: ${SUPER_ADMIN_PASSWORD:-ChangeMe123!}
+      EXEC_LOG_DB_URL: ${EXEC_LOG_DB_URL:-}
+      WAHA_BASE_URL: ${WAHA_BASE_URL:-}
+      WAHA_API_KEY: ${WAHA_API_KEY:-}
+      WAHA_SESSION: ${WAHA_SESSION:-default}
+      WHATSAPP_TRIGGER_KEYWORD: ${WHATSAPP_TRIGGER_KEYWORD:-@sms}
+      WHATSAPP_WEBHOOK_TOKEN: ${WHATSAPP_WEBHOOK_TOKEN:-change-me-webhook-token}
+    ports:
+      - "8050:8000"
+
+  frontend:
+    build: ./webfront
+    container_name: sms-gateway-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3050:80"
+
+volumes:
+  sms_gateway_db:

@@ -1,0 +1,40 @@
+# Secrets / env
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+*.db
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+*.local
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+!releases/android/*.apk
+*.keystore
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Android signing (never commit)
+android/keystore.properties
+*.jks
