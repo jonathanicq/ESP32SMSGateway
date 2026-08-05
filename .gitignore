@@ -29,6 +29,9 @@ android/local.properties
 !releases/android/*.apk
 *.keystore
 
+# PlatformIO
+esp/.pio/
+
 # OS / editor
 .DS_Store
 .idea/
