@@ -245,7 +245,7 @@ platformio device monitor -p /dev/ttyUSB0 --baud 115200
 - [ ] OTA (over-the-air) firmware updates
 - [ ] Web dashboard with real-time message log
 - [ ] GPS tracking (if using SIM800L with GPS)
-- [ ] Battery backup with deep sleep
+- [x] Battery backup (solar + USB-C charging) — see [`POWER_SOLAR_USBC.md`](POWER_SOLAR_USBC.md)
 - [ ] WebSocket real-time notifications
 
 ## License
