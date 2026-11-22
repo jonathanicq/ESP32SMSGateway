@@ -3,6 +3,28 @@
 All notable changes to the ESP32 firmware (`esp/`) are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.0]
+
+### Added
+- Several Wi-Fi networks (up to 5) tried in priority order; the first that connects wins, and the
+  gateway only opens its own AP if all of them fail. One scan first sizes the timeout (about 10 s for
+  a network seen in the scan, about 4 s for one not seen); none is skipped, since a scan can miss
+  hidden SSIDs. Configs saved by older firmware migrate to a single-network list on load.
+- Portal Wi-Fi tab: list with move up/down and remove, add from scan or manually. Passwords stay
+  masked; a masked password sent back keeps the stored one for that SSID.
+- `GET /api/gsm/status` (read-only, same Basic auth): raw and parsed CSQ, registration (CREG/CGREG),
+  operator, modem supply voltage, last reset reason (`brownout` = supply dip), uptime, Wi-Fi RSSI and
+  free heap. Tells a bad reading from no registration from a power problem.
+
+### Fixed
+- DNS: the DHCP-provided resolvers are now used as handed out. The previous forced override to
+  8.8.8.8 / 1.1.1.1 broke name resolution (NTP, backend) on networks that block outbound DNS to
+  external servers. The DNS probe now resolves the backend host instead of google.com.
+- Zero-signal warning now also mentions power: a supply or USB cable under 2 A gives no GSM signal.
+
+### Changed
+- Network scan names in the portal are inserted as text, not HTML.
+
 ## [1.2.0]
 
 ### Security
