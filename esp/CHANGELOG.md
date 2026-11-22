@@ -3,6 +3,32 @@
 All notable changes to the ESP32 firmware (`esp/`) are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.2.0]
+
+### Security
+- Backend TLS verifies the server certificate (ISRG Root X1); `setInsecure()` removed.
+- Web portal requires HTTP Basic auth (user `admin`, existing AP password) on every route except the page itself.
+- `GET /config` returns secrets masked (`********`); a masked value sent back means "keep the stored value".
+- Phone numbers are masked in the system log (last 4 digits kept).
+
+### Added
+- Outbox: each received SMS is stored before delivery and removed only after the backend accepts it.
+- Delivered-message log keeps only HMAC-SHA256 digests (per-device random key), never message text.
+- Pending messages are delivered when the backend comes back online and every 10 s while pending.
+- `GET /api/outbox/status` (counts only), `GET /api/backend/status`, `POST /api/backend/test`.
+- NTP time (WET/WEST) for log timestamps.
+
+### Fixed
+- Two SMS arriving in the same loop no longer overwrite each other.
+- Task watchdog set to 60 s with `esp_task_wdt_reconfigure` and fed during setup (5 s default caused boot loops).
+- Backend HTTP calls have a 10 s timeout.
+
+### Changed
+- Web UI taken from the 1.1.2 device page (includes the backend test tab).
+
+### Not changed (by decision)
+- WiFi, OTA and AP passwords are unchanged.
+
 ## [1.1.0]
 
 ### Added
