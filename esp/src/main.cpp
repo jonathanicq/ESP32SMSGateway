@@ -1455,17 +1455,20 @@ void setupWiFiMode() {
 }
 
 // --- Main Setup ---
+// The core already initialises the task watchdog with a 5 s timeout, so esp_task_wdt_init() is a no-op
+// here: the timeout has to be changed with esp_task_wdt_reconfigure(). Without this, setup() (WiFi,
+// DNS, modem AT commands) trips the watchdog and the gateway reboots in a loop.
 static void initWatchdog() {
-#if ESP_IDF_VERSION_MAJOR >= 5
+#if ESP_IDF_VERSION_MAJOR >= 5 && ESP_IDF_VERSION_MINOR >= 1
   esp_task_wdt_config_t cfg = {};
-  cfg.timeout_ms = 60 * 1000;   // long enough for modem init and WiFi connect
+  cfg.timeout_ms = 60 * 1000;
   cfg.idle_core_mask = 0;
   cfg.trigger_panic = true;
-  esp_task_wdt_init(&cfg);     // already initialised by the core: harmless error
+  esp_task_wdt_reconfigure(&cfg);
 #else
   esp_task_wdt_init(60, true);
 #endif
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL);  // ignored error if already subscribed
 }
 
 void setup() {
@@ -1484,8 +1487,11 @@ void setup() {
 
   loadConfig();
   initOutbox();
+  esp_task_wdt_reset();
   setupWiFiMode();
+  esp_task_wdt_reset();
   sim800l_init();
+  esp_task_wdt_reset();
 
   server.onNotFound(handleNotFound);
   server.begin();
