@@ -8,6 +8,12 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
+#include <esp_task_wdt.h>
+#include <esp_idf_version.h>
+#include "ui_html.h"
+#include "ca_isrg_x1.h"
+#include <mbedtls/md.h>
+#include <esp_system.h>
 #include <TinyGsmClient.h>
 #include <Wire.h>
 
@@ -86,7 +92,7 @@ int log_count = 0;
 WebServer server(80);
 const char* AP_SSID = "SIM800L-Gateway";
 const char* AP_PASSWORD = "12345678";
-const char* FIRMWARE_VERSION = "v1.1.0";
+const char* FIRMWARE_VERSION = "v1.2.0";
 
 volatile bool sms_received = false;
 String last_sms_sender;
@@ -114,6 +120,12 @@ String pairing_status = "unpaired";  // unpaired | pending | linked | error
 bool pairing_active = false;
 unsigned long last_pairing_action = 0;
 const unsigned long PAIRING_POLL_INTERVAL_MS = 5000;
+const unsigned long OUTBOX_RETRY_MS = 10000;   // retry period while messages are pending
+#define OUTBOX_FILE "/outbox.json"              // pending messages (plaintext until delivered)
+#define SENTLOG_FILE "/sentlog.json"            // HMAC-SHA256 digests of delivered messages only
+#define HMAC_KEY_FILE "/hmac.key"
+#define OUTBOX_MAX 200
+#define SENTLOG_MAX 500
 const unsigned long PAIRING_RETRY_INTERVAL_MS = 20000;
 
 // WiFi Scan
@@ -129,7 +141,33 @@ unsigned long last_wifi_scan = 0;
 // --- Configuration Management ---
 void saveConfig();  // defined below; loadConfig()'s URL migration needs it
 
+// Masks digit runs of 7+ digits (phone numbers) keeping the last 4, e.g. +351912345678 -> +351*******5678.
+static String maskPhoneNumbers(const char* in) {
+  String src(in), out;
+  int i = 0, n = src.length();
+  while (i < n) {
+    if (isDigit(src[i]) || (src[i] == '+' && i + 1 < n && isDigit(src[i + 1]))) {
+      int start = i;
+      if (src[i] == '+') i++;
+      int digits = 0, j = i;
+      while (j < n && isDigit(src[j])) { j++; digits++; }
+      if (digits >= 7) {
+        out += src.substring(start, i);
+        for (int k = 0; k < digits - 4; k++) out += '*';
+        out += src.substring(j - 4, j);
+      } else {
+        out += src.substring(start, j);
+      }
+      i = j;
+    } else {
+      out += src[i++];
+    }
+  }
+  return out;
+}
+
 void addLog(const char* type, const char* message) {
+  String masked = maskPhoneNumbers(message);
   if (log_count >= MAX_LOGS) {
     for (int i = 0; i < MAX_LOGS - 1; i++) {
       logs[i] = logs[i + 1];
@@ -140,7 +178,7 @@ void addLog(const char* type, const char* message) {
   struct tm* timeinfo = localtime(&now);
   strftime(logs[log_count].timestamp, sizeof(logs[log_count].timestamp), "%d/%m %H:%M:%S", timeinfo);
   strlcpy(logs[log_count].type, type, sizeof(logs[log_count].type));
-  strlcpy(logs[log_count].message, message, sizeof(logs[log_count].message));
+  strlcpy(logs[log_count].message, masked.c_str(), sizeof(logs[log_count].message));
   log_count++;
   Serial.printf("[LOG] %s | %s | %s\n", logs[log_count-1].timestamp, type, message);
 }
@@ -414,15 +452,201 @@ bool sendSMS(const String& number, const String& text) {
   return ok;
 }
 
+void enqueueSMS(const String& sender, const String& body);
+void flushOutbox();
+bool sendToBackend(String sender, String body);
+
+// --- Outbox and delivered-message log --------------------------------------
+// A received SMS is written to the outbox before anything else, and removed only after the backend
+// accepted it. The sent log stores HMAC-SHA256(key, sender|text|timestamp) for every delivered
+// message, so it can answer "was this already sent?" without containing any message text. The key
+// is random per device and never leaves the device.
+// Last backend call, shown in the portal (Teste tab). Body is never stored: it can contain SMS text.
+struct LastBackendCall {
+  bool has = false;
+  String when, method, url, error;
+  int http_code = 0;
+  unsigned long ms = 0;
+};
+LastBackendCall lastBackend;
+
+uint8_t hmac_key[32];
+int outbox_count = 0;
+unsigned long last_flush_attempt = 0;
+bool backend_online = false;
+
+bool loadJson(const char* path, JsonDocument& doc) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  return !err;
+}
+
+bool saveJson(const char* path, const JsonDocument& doc) {
+  File f = SPIFFS.open(path, "w");
+  if (!f) return false;
+  serializeJson(doc, f);
+  f.close();
+  return true;
+}
+
+JsonArray itemsOf(JsonDocument& doc, const char* key) {
+  if (doc[key].isNull()) return doc[key].to<JsonArray>();
+  return doc[key].as<JsonArray>();
+}
+
+void initOutbox() {
+  // Random per-device HMAC key, created once.
+  File f = SPIFFS.open(HMAC_KEY_FILE, "r");
+  bool loaded = false;
+  if (f && f.size() == 64) {
+    String hex = f.readString();
+    loaded = true;
+    for (int i = 0; i < 32; i++) {
+      char b[3] = {hex[i * 2], hex[i * 2 + 1], 0};
+      hmac_key[i] = (uint8_t)strtoul(b, nullptr, 16);
+    }
+  }
+  if (f) f.close();
+  if (!loaded) {
+    esp_fill_random(hmac_key, sizeof hmac_key);
+    File w = SPIFFS.open(HMAC_KEY_FILE, "w");
+    for (int i = 0; i < 32; i++) w.printf("%02x", hmac_key[i]);
+    w.close();
+    addLog("Outbox", "Chave de registo de envios criada");
+  }
+  JsonDocument box;
+  if (loadJson(OUTBOX_FILE, box)) outbox_count = itemsOf(box, "items").size();
+}
+
+String messageDigest(const char* from, const char* text, uint32_t ts) {
+  String input = String(from) + "\n" + text + "\n" + String(ts);
+  unsigned char out[32];
+  mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), hmac_key, sizeof hmac_key,
+                  reinterpret_cast<const unsigned char*>(input.c_str()), input.length(), out);
+  String hex;
+  for (int i = 0; i < 32; i++) {
+    char b[3];
+    snprintf(b, sizeof b, "%02x", out[i]);
+    hex += b;
+  }
+  return hex;
+}
+
+void sentLogAdd(JsonArray digests, const String& digest) {
+  while (digests.size() >= SENTLOG_MAX) digests.remove(0);
+  digests.add(digest);
+}
+
+void enqueueSMS(const String& sender, const String& body) {
+  JsonDocument box;
+  loadJson(OUTBOX_FILE, box);
+  JsonArray items = itemsOf(box, "items");
+  if (items.size() >= OUTBOX_MAX) {
+    items.remove(0);
+    addLog("Outbox", "Fila cheia: mensagem mais antiga descartada");
+  }
+  JsonObject it = items.add<JsonObject>();
+  it["from"] = sender;
+  it["text"] = body;
+  it["ts"] = (uint32_t)time(nullptr);
+  saveJson(OUTBOX_FILE, box);
+  outbox_count = items.size();
+}
+
+// Backend reachable (any HTTP answer below 500) means online. Going from offline to online
+// immediately delivers everything that is still pending.
+void noteBackendResult(int code) {
+  bool online = code >= 200 && code < 500;
+  if (online && !backend_online) {
+    backend_online = true;
+    addLog("Backend", "Ligado ao backend: a enviar mensagens pendentes");
+    flushOutbox();
+  } else if (!online && backend_online) {
+    backend_online = false;
+    addLog("Backend", "Backend inacessivel: mensagens ficam em fila");
+  }
+}
+
+// Sends every pending message that is not already in the sent log, oldest first.
+// Stops at the first transport/5xx failure (retried later); drops messages the backend
+// permanently rejects (4xx other than auth/rate limits) so they cannot block the queue.
+void flushOutbox() {
+  if (!WiFi.isConnected() || !config.api_key[0]) return;
+  JsonDocument box;
+  if (!loadJson(OUTBOX_FILE, box)) { outbox_count = 0; return; }
+  JsonArray items = itemsOf(box, "items");
+  if (items.size() == 0) { outbox_count = 0; return; }
+
+  JsonDocument logDoc;
+  loadJson(SENTLOG_FILE, logDoc);
+  JsonArray digests = itemsOf(logDoc, "digests");
+  bool logChanged = false;
+  bool changed = false;
+
+  for (size_t i = 0; i < items.size();) {
+    const char* from = items[i]["from"] | "";
+    const char* text = items[i]["text"] | "";
+    uint32_t ts = items[i]["ts"] | 0;
+    String digest = messageDigest(from, text, ts);
+
+    bool already = false;
+    for (JsonVariant v : digests) if (digest == (v | "")) { already = true; break; }
+    if (already) {
+      items.remove(i);
+      changed = true;
+      addLog("Outbox", "Mensagem ja enviada anteriormente: removida da fila");
+      continue;
+    }
+
+    bool ok = sendToBackend(String(from), String(text));
+    int code = lastBackend.http_code;
+    if (ok) {
+      sentLogAdd(digests, digest);
+      logChanged = true;
+      items.remove(i);
+      changed = true;
+      continue;
+    }
+    if (code >= 400 && code < 500 && code != 401 && code != 403 && code != 408 && code != 429) {
+      addLog("Outbox", ("Backend rejeitou a mensagem (HTTP " + String(code) + "): descartada").c_str());
+      items.remove(i);
+      changed = true;
+      continue;
+    }
+    if (code < 0 || code >= 500) backend_online = false;  // no flush here: avoids recursion
+    break;
+  }
+
+  if (changed) saveJson(OUTBOX_FILE, box);
+  if (logChanged) saveJson(SENTLOG_FILE, logDoc);
+  outbox_count = items.size();
+}
+
+String outboxStatusJson() {
+  JsonDocument doc;
+  JsonDocument box;
+  loadJson(OUTBOX_FILE, box);
+  JsonDocument logDoc;
+  loadJson(SENTLOG_FILE, logDoc);
+  doc["pending"] = itemsOf(box, "items").size();
+  doc["delivered_digests"] = itemsOf(logDoc, "digests").size();
+  doc["backend_online"] = backend_online;
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
 void handleSMSReceived(String sender, String body) {
   Serial.printf("[SMS] From: %s | Body: %s\n", sender.c_str(), body.c_str());
 
   String preview = body.length() > 40 ? body.substring(0, 40) + "..." : body;
   addLog("SMS", ("Recebido de " + sender + ": " + preview).c_str());
 
-  sms_received = true;
-  last_sms_sender = sender;
-  last_sms_body = body;
+  // Persist first: a message is never dropped because the backend was down or a second SMS arrived.
+  enqueueSMS(sender, body);
+  flushOutbox();
 }
 
 void scanWiFiNetworks() {
@@ -562,16 +786,35 @@ void checkSMS() {
 // device in the backoffice - including its Telegram/WhatsApp forwarding,
 // which the backend already does server-side per account (see BridgeSettings).
 
+
+static void recordBackendCall(const char* method, const String& url, int code, unsigned long startMs) {
+  lastBackend.has = true;
+  lastBackend.method = method;
+  lastBackend.url = url;
+  lastBackend.http_code = code;
+  lastBackend.ms = millis() - startMs;
+  time_t now = time(nullptr);
+  char buf[24];
+  strftime(buf, sizeof buf, "%d/%m %H:%M:%S", localtime(&now));
+  lastBackend.when = buf;
+  if (code < 0) lastBackend.error = "Falha de ligacao";
+  else if (code < 200 || code >= 300) lastBackend.error = "HTTP " + String(code);
+  else lastBackend.error = "";
+}
+
 bool backendPost(const String& path, const String& payload, String& responseOut) {
-  backend_client.setInsecure(); // no CA bundle on device, so TLS cert isn't validated
+  backend_client.setCACert(BACKEND_CA_PEM);  // verify the server certificate (ISRG Root X1)
   HTTPClient https;
   String url = String(config.api_url) + path;
-  if (!https.begin(backend_client, url)) return false;
+  unsigned long t0 = millis();
+  if (!https.begin(backend_client, url)) { recordBackendCall("POST", url, -1, t0); return false; }
+  https.setTimeout(10000);
   https.addHeader("Content-Type", "application/json");
   if (config.api_key[0]) https.addHeader("X-API-Key", config.api_key);
   int code = https.POST(payload);
   responseOut = https.getString();
   https.end();
+  recordBackendCall("POST", url, code, t0);
   return code >= 200 && code < 300;
 }
 
@@ -579,14 +822,17 @@ bool backendPost(const String& path, const String& payload, String& responseOut)
 // callers can tell "server said no" (e.g. 401 = revoked key) apart from
 // "network/DNS trouble, try again later".
 int backendGetCode(const String& path, String& responseOut) {
-  backend_client.setInsecure();
+  backend_client.setCACert(BACKEND_CA_PEM);  // verify the server certificate (ISRG Root X1)
   HTTPClient https;
   String url = String(config.api_url) + path;
-  if (!https.begin(backend_client, url)) return -1;
+  unsigned long t0 = millis();
+  if (!https.begin(backend_client, url)) { recordBackendCall("GET", url, -1, t0); return -1; }
+  https.setTimeout(10000);
   if (config.api_key[0]) https.addHeader("X-API-Key", config.api_key);
   int code = https.GET();
   responseOut = https.getString();
   https.end();
+  recordBackendCall("GET", url, code, t0);
   return code;
 }
 
@@ -626,6 +872,7 @@ void pollPendingMessages() {
 
   String response;
   int code = backendGetCode("/device/messages/pending", response);
+  noteBackendResult(code);
 
   if (code == 401 || code == 403) {
     // The key doesn't work anymore (device deleted in the backoffice, DB
@@ -741,24 +988,32 @@ void pollPairing() {
 
 // --- Web Server Handlers ---
 void handleRoot() {
-  String html = String("<!DOCTYPE html><html><head><title>SIM800L Gateway</title><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>body{font-family:Arial;margin:20px;background:#f5f5f5}.container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}h1{color:#333;text-align:center;margin:0 0 10px 0}.signal-bar{background:#007bff;height:30px;border-radius:4px;margin:15px 0;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold;font-size:14px}.signal-label{color:#666;font-weight:bold;margin-bottom:5px}h2{color:#555;font-size:18px;margin:15px 0 10px 0}.form-group{margin-bottom:15px}label{display:block;margin-bottom:5px;color:#666;font-weight:bold}input,select,textarea{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-family:Arial}button{width:100%;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer;font-size:16px}button:hover{background:#0056b3}.tabs{display:flex;flex-wrap:wrap;margin-bottom:20px;border-bottom:2px solid #ddd;overflow-x:auto}.tab-button{flex:0 0 auto;padding:10px 15px;background:0;border:none;cursor:pointer;color:#666;border-bottom:3px solid transparent;white-space:nowrap;font-size:14px}.tab-button.active{color:#007bff;border-bottom-color:#007bff}.tab-content{display:none}.tab-content.active{display:block}.status{padding:10px;border-radius:4px;margin-bottom:15px;display:none}.status.success{background:#d4edda;color:#155724;display:block}.status.error{background:#f8d7da;color:#721c24;display:block}.checkbox-group{display:flex;gap:15px}.checkbox-group label{margin-bottom:0;display:flex;align-items:center;width:auto}.checkbox-group input{width:auto}.log-list{background:#f9f9f9;border:1px solid #ddd;border-radius:4px;max-height:300px;overflow-y:auto;font-size:12px;font-family:monospace}.log-item{padding:8px;border-bottom:1px solid #eee;display:flex;gap:10px}.log-time{color:#999;min-width:70px}.log-type{color:#007bff;font-weight:bold;min-width:70px}.log-msg{color:#333;flex:1}</style></head><body><div class=\"container\"><h1>SIM800L Gateway</h1><div style=\"text-align:center;color:#999;font-size:11px;margin-bottom:8px\">") + FIRMWARE_VERSION + "</div><div class=\"signal-label\" id=\"sim-number\">Numero: --</div><div class=\"signal-label\">Signal Strength</div><div class=\"signal-bar\" id=\"signal-bar\" style=\"width:0%\">-- %</div><div id=\"signal-warning\" style=\"display:none;color:#dc3545;font-weight:bold;font-size:13px;margin:-10px 0 15px 0\">Verifique se ha antena conectada</div><div id=\"status\" class=\"status\"></div><div class=\"tabs\"><button class=\"tab-button active\" onclick=\"showTab('wifi')\">WiFi</button><button class=\"tab-button\" onclick=\"showTab('api')\">API</button><button class=\"tab-button\" onclick=\"showTab('teste')\">Teste</button><button class=\"tab-button\" onclick=\"showTab('gsm')\">GSM</button><button class=\"tab-button\" onclick=\"showTab('whatsapp')\">WhatsApp</button><button class=\"tab-button\" onclick=\"showTab('logs')\">Log</button></div><div id=\"wifi\" class=\"tab-content active\"><h2>WiFi</h2><form onsubmit=\"saveWiFi(event)\"><div class=\"form-group\"><label>Available Networks</label><select id=\"wifi_list\" onchange=\"selectNetwork()\"><option value=\"\">-- Procurando redes... --</option></select></div><div class=\"form-group\"><label>SSID</label><input type=\"text\" id=\"wifi_ssid\" placeholder=\"WiFi network name\" required></div><div class=\"form-group\"><label>Password</label><input type=\"password\" id=\"wifi_password\" placeholder=\"WiFi password\"></div><button type=\"submit\">Save</button></form></div><div id=\"api\" class=\"tab-content\"><h2>Backend API</h2><div class=\"form-group\"><label>Pareamento</label><div id=\"pairing-box\" style=\"padding:10px;background:#f0f0f0;border-radius:4px;font-size:14px\">Carregando...</div></div><form onsubmit=\"saveAPI(event)\"><div class=\"form-group\"><label>API URL</label><input type=\"text\" id=\"api_url\" placeholder=\"https://sms-gateway.thecoordinates.app/api\" required></div><div class=\"form-group\"><label>API Key</label><input type=\"password\" id=\"api_key\" placeholder=\"Preenchido automaticamente ao parear\"></div><button type=\"submit\">Save</button></form></div><div id=\"teste\" class=\"tab-content\"><h2>SMS de Teste</h2><div class=\"form-group\"><label>Numero (E.164)</label><input type=\"tel\" id=\"test_phone\" placeholder=\"+5511999999999\"></div><div class=\"form-group\"><label>Mensagem</label><input type=\"text\" id=\"test_message\" value=\"Teste do gateway SIM800L\"></div><button onclick=\"sendTestSMS()\">Enviar SMS de teste</button><div id=\"test-result\" style=\"margin-top:10px;font-size:14px\"></div></div><div id=\"gsm\" class=\"tab-content\"><h2>GSM Config</h2><form onsubmit=\"saveGSM(event)\"><div class=\"form-group\"><label><input type=\"checkbox\" id=\"roaming_enabled\"> Enable Roaming Internacional</label></div><div class=\"form-group\"><label>Network Selection</label><select id=\"gsm_network\"><option value=\"AUTO\">AUTO (Manual)</option><optgroup label=\"Portugal\"><option value=\"22801\">Vodafone PT (22801)</option><option value=\"22806\">Optimus PT (22806)</option><option value=\"22804\">MEO/Altice PT (22804)</option><option value=\"22805\">MEO/Altice PT (22805)</option><option value=\"22807\">CTT Móvel PT (22807)</option><option value=\"22808\">Telemóvel PT (22808)</option><option value=\"22888\">FREE Mobile PT (22888)</option></optgroup><optgroup label=\"France\"><option value=\"20801\">Orange FR (20801)</option><option value=\"20810\">SFR/Vodafone FR (20810)</option><option value=\"20811\">SFR FR (20811)</option><option value=\"20815\">FREE Mobile FR (20815)</option><option value=\"20820\">Bouygues FR (20820)</option><option value=\"20821\">Bouygues FR (20821)</option></optgroup><optgroup label=\"Other\"><option value=\"31026\">Vodafone ES (31026)</option><option value=\"21407\">Vodafone BR (21407)</option><option value=\"21601\">Vivo BR (21601)</option><option value=\"21901\">Claro BR (21901)</option><option value=\"24001\">Vodafone DE (24001)</option><option value=\"44000\">USA Carriers (44000)</option></optgroup></select></div><div class=\"form-group\"><label>APN</label><input type=\"text\" id=\"apn\" placeholder=\"APN (ex: internet.vodafone.pt)\"></div><div class=\"form-group\"><label>APN User</label><input type=\"text\" id=\"apn_user\" placeholder=\"APN Username\"></div><div class=\"form-group\"><label>APN Password</label><input type=\"password\" id=\"apn_password\" placeholder=\"APN Password\"></div><div class=\"form-group\"><label>SIM PIN (deixe em branco se sem PIN)</label><input type=\"password\" id=\"sim_pin\" placeholder=\"1234\" maxlength=\"4\"></div><div class=\"form-group\"><label>Numero do telefone (se a operadora nao informar automaticamente)</label><input type=\"tel\" id=\"manual_phone_number\" placeholder=\"+5511999999999\"></div><button type=\"submit\">Save</button></form></div><div id=\"whatsapp\" class=\"tab-content\"><h2>WhatsApp</h2><form onsubmit=\"saveWhatsApp(event)\"><div class=\"form-group\"><label><input type=\"checkbox\" id=\"whatsapp_enabled\"> Enable WhatsApp</label></div><div class=\"form-group\"><label>Forward Number (E.164)</label><input type=\"tel\" id=\"whatsapp_number\" placeholder=\"+1234567890\"></div><button type=\"submit\">Save</button></form></div><div id=\"logs\" class=\"tab-content\"><h2>System Log</h2><div class=\"log-list\" id=\"log-list\">Loading...</div><button onclick=\"refreshLogs()\" style=\"margin-top:10px;width:auto;padding:8px 15px\">Refresh</button></div></div><script>setInterval(updateSignal,2000);setInterval(scanWiFi,15000);setInterval(updatePairing,5000);async function updatePairing(){try{const r=await fetch('/pairing'),d=await r.json(),b=document.getElementById('pairing-box');if(d.paired){b.innerHTML='<b>Pareado</b> com o backend.'}else if(d.claim_code){b.innerHTML='Codigo de pareamento: <b style=\"font-size:20px\">'+d.claim_code+'</b><br>Insira em Dispositivos no backoffice (expira em 15 min)'}else{b.innerHTML='Aguardando WiFi para iniciar pareamento...'}}catch(e){}}async function sendTestSMS(){const b=document.getElementById('test-result');b.textContent='Enviando...';try{const r=await fetch('/api/sms/test',{method:'POST',body:JSON.stringify({phone:document.getElementById('test_phone').value,text:document.getElementById('test_message').value})}),d=await r.json();b.textContent=d.ok?'SMS enviado!':'Falha: '+(d.error||'erro desconhecido')}catch(e){b.textContent='Erro: '+e.message}}async function updateSignal(){const e=await fetch('/signal'),t=await e.json(),o=document.getElementById('signal-bar');o.style.width=t.signal+'%',o.textContent=(t.signal+'').padStart(2,'0')+'% - '+t.quality,document.getElementById('sim-number').textContent='Numero: '+(t.sim_number||'nao disponivel'),document.getElementById('signal-warning').style.display=t.signal===0?'block':'none'}async function scanWiFi(){try{const e=await fetch('/api/wifi/scan'),t=await e.json(),o=document.getElementById('wifi_list');if(t.networks&&t.networks.length>0){o.innerHTML=t.networks.map(e=>'<option value=\"'+e.ssid+'\">'+e.ssid+' ('+e.signal+'% - '+e.encryption+')</option>').join('')}else{o.innerHTML='<option value=\"\">-- Nenhuma rede encontrada --</option>'}}catch(e){console.error('Erro ao scanear WiFi:',e)}}function selectNetwork(){const e=document.getElementById('wifi_list').value;e&&(document.getElementById('wifi_ssid').value=e)}scanWiFi();function showTab(t){document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.tab-button').forEach(e=>e.classList.remove('active'));document.getElementById(t).classList.add('active');event.target.classList.add('active');t==='logs'&&refreshLogs()}async function loadConfig(){const e=await fetch('/config'),t=await e.json();document.getElementById('wifi_ssid').value=t.wifi_ssid||'';document.getElementById('wifi_password').value=t.wifi_password||'';document.getElementById('api_url').value=t.api_url||'';document.getElementById('api_key').value=t.api_key||'';document.getElementById('whatsapp_number').value=t.whatsapp_number||'';document.getElementById('whatsapp_enabled').checked=t.whatsapp_enabled!==false;document.getElementById('roaming_enabled').checked=t.roaming_enabled||false;document.getElementById('gsm_network').value=t.gsm_network||'AUTO';document.getElementById('apn').value=t.apn||'';document.getElementById('apn_user').value=t.apn_user||'';document.getElementById('apn_password').value=t.apn_password||'';document.getElementById('sim_pin').value=t.sim_pin||'';document.getElementById('manual_phone_number').value=t.manual_phone_number||''}async function refreshLogs(){const e=await fetch('/logs'),t=await e.json(),o=document.getElementById('log-list');o.innerHTML=t.logs.map(e=>'<div class=\"log-item\"><div class=\"log-time\">'+e.timestamp+'</div><div class=\"log-type\">'+e.type+'</div><div class=\"log-msg\">'+e.message+'</div></div>').join('')}async function saveWiFi(e){e.preventDefault();await saveSettings({wifi_ssid:document.getElementById('wifi_ssid').value,wifi_password:document.getElementById('wifi_password').value},'WiFi')}async function saveAPI(e){e.preventDefault();await saveSettings({api_url:document.getElementById('api_url').value,api_key:document.getElementById('api_key').value},'API')}async function saveGSM(e){e.preventDefault();await saveSettings({roaming_enabled:document.getElementById('roaming_enabled').checked,gsm_network:document.getElementById('gsm_network').value,apn:document.getElementById('apn').value,apn_user:document.getElementById('apn_user').value,apn_password:document.getElementById('apn_password').value,sim_pin:document.getElementById('sim_pin').value,manual_phone_number:document.getElementById('manual_phone_number').value},'GSM')}async function saveWhatsApp(e){e.preventDefault();await saveSettings({whatsapp_enabled:document.getElementById('whatsapp_enabled').checked,whatsapp_number:document.getElementById('whatsapp_number').value},'WhatsApp')}async function saveSettings(e,t){try{const o=await fetch('/config',{method:'POST',body:JSON.stringify(e)}),a=document.getElementById('status');o.ok?(a.className='status success',a.textContent='[OK] '+t+' saved!'):(a.className='status error',a.textContent='[ERROR] Failed to save '+t),setTimeout(()=>a.className='status',3000)}catch(e){document.getElementById('status').className='status error',document.getElementById('status').textContent='Error: '+e.message}}loadConfig();updateSignal();updatePairing()</script></body></html>";
+  String html = String(UI_HTML);
+  html.replace("__FW_VERSION__", FIRMWARE_VERSION);
   server.send(200, "text/html", html);
+}
+
+// Secrets are never returned in clear. The UI sends the mask back unchanged, which means "keep".
+static const char* SECRET_MASK = "********";
+static String maskSecret(const char* v) { return v[0] ? String(SECRET_MASK) : String(""); }
+static bool isMaskedValue(JsonVariantConst v) {
+  return v.is<const char*>() && strcmp(v.as<const char*>(), SECRET_MASK) == 0;
 }
 
 void handleGetConfig() {
   JsonDocument doc;
   doc["wifi_ssid"] = config.wifi_ssid;
-  doc["wifi_password"] = config.wifi_password;
+  doc["wifi_password"] = maskSecret(config.wifi_password);
   doc["api_url"] = config.api_url;
-  doc["api_key"] = config.api_key;
+  doc["api_key"] = maskSecret(config.api_key);
   doc["whatsapp_number"] = config.whatsapp_number;
   doc["whatsapp_enabled"] = config.whatsapp_enabled;
   doc["roaming_enabled"] = config.roaming_enabled;
   doc["gsm_network"] = config.gsm_network;
   doc["apn"] = config.apn;
   doc["apn_user"] = config.apn_user;
-  doc["apn_password"] = config.apn_password;
-  doc["sim_pin"] = config.sim_pin;
+  doc["apn_password"] = maskSecret(config.apn_password);
+  doc["sim_pin"] = maskSecret(config.sim_pin);
   doc["manual_phone_number"] = config.manual_phone_number;
 
   String response;
@@ -828,13 +1083,13 @@ void handlePostConfig() {
   if (!doc["wifi_ssid"].isNull()) {
     strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
   }
-  if (!doc["wifi_password"].isNull()) {
+  if (!doc["wifi_password"].isNull() && !isMaskedValue(doc["wifi_password"])) {
     strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
   }
   if (!doc["api_url"].isNull()) {
     strlcpy(config.api_url, doc["api_url"] | "", sizeof(config.api_url));
   }
-  if (!doc["api_key"].isNull()) {
+  if (!doc["api_key"].isNull() && !isMaskedValue(doc["api_key"])) {
     strlcpy(config.api_key, doc["api_key"] | "", sizeof(config.api_key));
   }
   if (!doc["whatsapp_number"].isNull()) {
@@ -855,10 +1110,10 @@ void handlePostConfig() {
   if (!doc["apn_user"].isNull()) {
     strlcpy(config.apn_user, doc["apn_user"] | "", sizeof(config.apn_user));
   }
-  if (!doc["apn_password"].isNull()) {
+  if (!doc["apn_password"].isNull() && !isMaskedValue(doc["apn_password"])) {
     strlcpy(config.apn_password, doc["apn_password"] | "", sizeof(config.apn_password));
   }
-  if (!doc["sim_pin"].isNull()) {
+  if (!doc["sim_pin"].isNull() && !isMaskedValue(doc["sim_pin"])) {
     strlcpy(config.sim_pin, doc["sim_pin"] | "", sizeof(config.sim_pin));
   }
   if (!doc["manual_phone_number"].isNull()) {
@@ -903,7 +1158,46 @@ void handleGetPairing() {
   server.send(200, "application/json", response);
 }
 
+void handleGetBackendStatus() {
+  JsonDocument doc;
+  doc["has_call"] = lastBackend.has;
+  doc["key_set"] = config.api_key[0] != 0;
+  doc["paired"] = config.api_key[0] != 0;
+  doc["when"] = lastBackend.when;
+  doc["method"] = lastBackend.method;
+  doc["url"] = lastBackend.url;
+  doc["http_code"] = lastBackend.http_code;
+  doc["error"] = lastBackend.error;
+  doc["ms"] = lastBackend.ms;
+  doc["body"] = "";  // never exposed: bodies can contain SMS text
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handlePostBackendTest() {
+  String resp;
+  backendGetCode("/device/messages/pending", resp);  // same authenticated call the poller makes
+  handleGetBackendStatus();
+}
+
 void handleNotFound() {
+  // Everything except the page itself requires the portal password (Basic auth, user "admin").
+  // The password is the existing AP password, so no password is added or removed.
+  if (server.uri() != "/" && !server.authenticate("admin", AP_PASSWORD)) {
+    server.requestAuthentication(BASIC_AUTH, "SIM800L Gateway");
+    return;
+  }
+  if (server.method() == HTTP_GET && server.uri() == "/api/outbox/status") {
+    server.send(200, "application/json", outboxStatusJson());  // counts only, never message content
+    return;
+  } else if (server.method() == HTTP_GET && server.uri() == "/api/backend/status") {
+    handleGetBackendStatus();
+    return;
+  } else if (server.method() == HTTP_POST && server.uri() == "/api/backend/test") {
+    handlePostBackendTest();
+    return;
+  }
   if (server.method() == HTTP_GET && server.uri() == "/config") {
     handleGetConfig();
   } else if (server.method() == HTTP_POST && server.uri() == "/config") {
@@ -1148,6 +1442,7 @@ void setupWiFiMode() {
     Serial.printf("[WiFi] DNS probe google.com -> %s\n",
                   probeOk ? probeIp.toString().c_str() : "FAILED");
 
+    configTzTime("WET0WEST,M3.5.0/1,M10.5.0", "pool.ntp.org", "time.google.com");  // log timestamps
     autoConfigureAPN();
     server.onNotFound(handleNotFound);
     server.begin();
@@ -1160,9 +1455,23 @@ void setupWiFiMode() {
 }
 
 // --- Main Setup ---
+static void initWatchdog() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t cfg = {};
+  cfg.timeout_ms = 60 * 1000;   // long enough for modem init and WiFi connect
+  cfg.idle_core_mask = 0;
+  cfg.trigger_panic = true;
+  esp_task_wdt_init(&cfg);     // already initialised by the core: harmless error
+#else
+  esp_task_wdt_init(60, true);
+#endif
+  esp_task_wdt_add(NULL);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  initWatchdog();
   Serial.printf("\n\n=== SIM800L SMS Gateway %s ===\n\n", FIRMWARE_VERSION);
 
   pinMode(RST_PIN, OUTPUT);
@@ -1174,6 +1483,7 @@ void setup() {
   }
 
   loadConfig();
+  initOutbox();
   setupWiFiMode();
   sim800l_init();
 
@@ -1183,6 +1493,7 @@ void setup() {
 
 // --- Main Loop ---
 void loop() {
+  esp_task_wdt_reset();
   ArduinoOTA.handle();
   checkSMS();
   server.handleClient();
@@ -1208,9 +1519,9 @@ void loop() {
     }
   }
 
-  if (sms_received) {
-    sms_received = false;
-    sendToBackend(last_sms_sender, last_sms_body);
+  if (outbox_count > 0 && millis() - last_flush_attempt > OUTBOX_RETRY_MS) {
+    last_flush_attempt = millis();
+    flushOutbox();
   }
 
   delay(10);
