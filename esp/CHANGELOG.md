@@ -3,6 +3,25 @@
 All notable changes to the ESP32 firmware (`esp/`) are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.4.0]
+
+### Added
+- Received SMS are now stored on the SIM by the modem (`AT+CNMI=2,1`, storage `SM`) and only announced
+  with `+CMTI`. The SIM is a persistent buffer: an SMS that arrives while the ESP32 is rebooting, or
+  while loop() is blocked in a slow HTTPS call, is no longer lost.
+- The firmware reads the SIM at boot, on every `+CMTI`, and every 60 s as a safety net (a URC can be
+  missed while another AT command is waiting). Each message goes to the flash outbox first and is
+  deleted from the SIM only after that succeeded, so it always lives in the SIM or in the outbox.
+- `GET /api/gsm/status` also reports `sim_sms_used` / `sim_sms_total` (SMS currently stored on the SIM).
+
+### Changed
+- The outbox digest of a received SMS now uses the message's own SMSC timestamp (not the time it was
+  read), so re-reading the same SMS from the SIM after an interrupted cleanup does not queue or send it twice.
+
+### Notes
+- Messages already stored on the SIM when this firmware first runs are forwarded once.
+- The SIM holds only a few dozen messages; the outbox (200) takes over as soon as a message is read.
+
 ## [1.3.1]
 
 ### Fixed
