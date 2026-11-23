@@ -98,7 +98,7 @@ int log_count = 0;
 WebServer server(80);
 const char* AP_SSID = "SIM800L-Gateway";
 const char* AP_PASSWORD = "12345678";
-const char* FIRMWARE_VERSION = "v1.3.1";
+const char* FIRMWARE_VERSION = "v1.4.0";
 
 volatile bool sms_received = false;
 String last_sms_sender;
@@ -437,9 +437,13 @@ void sim800l_init() {
   modem.sendAT(GF("+CSCS=\"GSM\""));
   modem.waitResponse();
 
-  // mode 2 = URC not dropped while a command is in flight, mt 2 = deliver
-  // incoming SMS directly as "+CMT:" instead of just an index to look up
-  modem.sendAT(GF("+CNMI=2,2,0,0,0"));
+  // Incoming SMS are stored on the SIM ("SM") and only announced with "+CMTI: "SM",<index>".
+  // The SIM is then a persistent buffer: a message is not lost when it arrives while the ESP32
+  // is rebooting, or while loop() is blocked in a slow HTTPS call (a "+CMT" delivered straight
+  // down the UART would be gone). drainSimSms() moves them to the flash outbox and frees the slot.
+  modem.sendAT(GF("+CPMS=\"SM\",\"SM\",\"SM\""));
+  modem.waitResponse();
+  modem.sendAT(GF("+CNMI=2,1,0,0,0"));
   modem.waitResponse();
 
   modem.sendAT(GF("+CSMP=17,167,0,0"));
@@ -483,7 +487,7 @@ bool sendSMS(const String& number, const String& text) {
   return ok;
 }
 
-void enqueueSMS(const String& sender, const String& body);
+bool enqueueSMS(const String& sender, const String& body, uint32_t ts = 0);
 void flushOutbox();
 bool sendToBackend(String sender, String body);
 
@@ -590,10 +594,27 @@ void sentLogAdd(JsonArray digests, const String& digest) {
   digests.add(digest);
 }
 
-void enqueueSMS(const String& sender, const String& body) {
+// Returns true when the message is safely stored in the outbox (or was already there / already
+// delivered). ts is the message's own timestamp when known, so re-reading the same SMS from the
+// SIM yields the same digest; 0 means "now".
+bool enqueueSMS(const String& sender, const String& body, uint32_t ts) {
+  if (ts == 0) ts = (uint32_t)time(nullptr);
   JsonDocument box;
   loadJson(OUTBOX_FILE, box);
   JsonArray items = itemsOf(box, "items");
+
+  // Already queued (e.g. the SIM cleanup was interrupted by a reset): nothing to add.
+  for (JsonObject q : items) {
+    if (sender == (q["from"] | "") && body == (q["text"] | "") && (uint32_t)(q["ts"] | 0) == ts) return true;
+  }
+  // Already delivered earlier.
+  {
+    JsonDocument logDoc;
+    loadJson(SENTLOG_FILE, logDoc);
+    String digest = messageDigest(sender.c_str(), body.c_str(), ts);
+    for (JsonVariant v : itemsOf(logDoc, "digests")) if (digest == (v | "")) return true;
+  }
+
   if (items.size() >= OUTBOX_MAX) {
     items.remove(0);
     addLog("Outbox", "Fila cheia: mensagem mais antiga descartada");
@@ -601,9 +622,10 @@ void enqueueSMS(const String& sender, const String& body) {
   JsonObject it = items.add<JsonObject>();
   it["from"] = sender;
   it["text"] = body;
-  it["ts"] = (uint32_t)time(nullptr);
-  saveJson(OUTBOX_FILE, box);
+  it["ts"] = ts;
+  bool saved = saveJson(OUTBOX_FILE, box);
   outbox_count = items.size();
+  return saved;
 }
 
 // Backend reachable (any HTTP answer below 500) means online. Going from offline to online
@@ -807,11 +829,95 @@ String ucs2HexToUtf8(const String& hex) {
   return out;
 }
 
+// --- SMS stored on the SIM ---------------------------------------------------------------------
+static bool sim_drain_needed = true;  // true at boot, set again by "+CMTI:" and by the periodic timer
+static unsigned long last_sim_drain = 0;
+const unsigned long SIM_DRAIN_EVERY_MS = 60000;  // safety net: a "+CMTI" URC can be missed
+
+static int32_t daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  int yoe = y - era * 400;
+  int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// SMSC timestamp "yy/mm/dd,hh:mm:ss+zz" (zz = offset from UTC in quarter hours) -> Unix time, 0 if unparsable.
+static uint32_t smscTimestampToEpoch(const String& s) {
+  int yy, mo, dd, hh, mi, ss, zz;
+  char sign = '+';
+  if (sscanf(s.c_str(), "%d/%d/%d,%d:%d:%d%c%d", &yy, &mo, &dd, &hh, &mi, &ss, &sign, &zz) != 8) return 0;
+  if (yy < 0 || yy > 99 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return 0;
+  int64_t local = (int64_t)daysFromCivil(2000 + yy, mo, dd) * 86400 + hh * 3600 + mi * 60 + ss;
+  int64_t utc = local - (sign == '-' ? -1 : 1) * (int64_t)zz * 900;
+  return utc > 0 ? (uint32_t)utc : 0;
+}
+
+// Reads every received SMS stored on the SIM, puts each in the flash outbox and deletes it from the
+// SIM only after that succeeded. A message therefore always lives in the SIM or in the outbox.
+static void drainSimSms() {
+  static int failures = 0;
+  modem.sendAT(GF("+CMGL=\"ALL\""));
+  String resp;
+  if (modem.waitResponse(15000, resp) != 1) {
+    // Normal right after boot (the modem is still registering): retry soon, and only complain
+    // when it keeps failing.
+    if (++failures == 3) addLog("SMS", "Falha ao ler SMS guardados no SIM");
+    last_sim_drain = millis() - SIM_DRAIN_EVERY_MS + 5000;  // next attempt in about 5 s
+    return;
+  }
+  failures = 0;
+  resp.replace("\r", "");
+
+  int term = resp.lastIndexOf("\nOK");
+  int handled = 0;
+  int pos = 0;
+  while (true) {
+    int h = resp.indexOf("+CMGL:", pos);
+    if (h < 0) break;
+    int eol = resp.indexOf('\n', h);
+    if (eol < 0) break;
+    int next = resp.indexOf("\n+CMGL:", eol);
+    int end = next >= 0 ? next : (term > eol ? term : (int)resp.length());
+    pos = end > h ? end : eol;
+
+    // +CMGL: <index>,"<stat>","<sender>","<alpha>","<timestamp>"
+    String header = resp.substring(h, eol);
+    int idx = atoi(header.c_str() + 6);
+    int q[8], nq = 0;
+    for (int i = 0; i < (int)header.length() && nq < 8; i++) if (header[i] == '"') q[nq++] = i;
+    if (nq < 8 || idx <= 0) continue;
+    String stat = header.substring(q[0] + 1, q[1]);
+    String sender = header.substring(q[2] + 1, q[3]);
+    String stamp = header.substring(q[6] + 1, q[7]);
+    if (!stat.startsWith("REC")) continue;  // stored outgoing messages are not ours to forward
+
+    String body = resp.substring(eol + 1, end);
+    body.trim();
+    String decoded = looksLikeUcs2Hex(body) ? ucs2HexToUtf8(body) : latin1ToUtf8(body);
+
+    String preview = decoded.length() > 40 ? decoded.substring(0, 40) + "..." : decoded;
+    addLog("SMS", ("Recebido de " + sender + ": " + preview).c_str());
+    if (enqueueSMS(sender, decoded, smscTimestampToEpoch(stamp))) {
+      modem.sendAT(GF("+CMGD="), idx);
+      modem.waitResponse(5000);
+      handled++;
+    } else {
+      addLog("SMS", "Nao foi possivel guardar o SMS na fila: fica no SIM");
+    }
+  }
+  if (handled > 0) flushOutbox();
+}
+
 void checkSMS() {
   if (sim800l.available()) {
     String line = sim800l.readStringUntil('\n');
     line.trim();
     Serial.printf("[SIM800L] %s\n", line.c_str());
+
+    // New SMS stored on the SIM: "+CMTI: "SM",<index>"
+    if (line.startsWith("+CMTI:")) sim_drain_needed = true;
 
     // Parse incoming SMS: +CMT: "+1234567890","","21/06/29,14:32:45+00"
     if (line.startsWith("+CMT:")) {
@@ -1304,6 +1410,14 @@ void handleGetGsmStatus() {
   String cops = gsmQuery("+COPS?");
   String cbc = gsmQuery("+CBC");
 
+  // +CPMS: "SM",<used>,<total>,...  (SMS currently stored on the SIM)
+  String cpms = gsmQuery("+CPMS?");
+  int used = -1, total = -1;
+  int pc = cpms.indexOf("+CPMS:");
+  if (pc >= 0) sscanf(cpms.c_str() + pc + 6, " \"%*[^\"]\",%d,%d", &used, &total);
+  doc["sim_sms_used"] = used;
+  doc["sim_sms_total"] = total;
+
   doc["csq_raw"] = csq;
   doc["creg_raw"] = creg;
   doc["cgreg_raw"] = cgreg;
@@ -1724,6 +1838,12 @@ void loop() {
     signal_strength = getSignalStrength();
     last_signal_check = millis();
     Serial.printf("[Signal] Strength: %d%%\n", signal_strength);
+  }
+
+  if (sim_drain_needed || millis() - last_sim_drain > SIM_DRAIN_EVERY_MS) {
+    sim_drain_needed = false;
+    last_sim_drain = millis();
+    drainSimSms();
   }
 
   if (wifi_disc_pending) {
