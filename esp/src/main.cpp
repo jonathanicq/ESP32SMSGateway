@@ -98,7 +98,7 @@ int log_count = 0;
 WebServer server(80);
 const char* AP_SSID = "SIM800L-Gateway";
 const char* AP_PASSWORD = "12345678";
-const char* FIRMWARE_VERSION = "v1.3.0";
+const char* FIRMWARE_VERSION = "v1.3.1";
 
 volatile bool sms_received = false;
 String last_sms_sender;
@@ -363,6 +363,9 @@ void sim800l_init() {
   sim800l_powerOn();
   delay(3000);  // Wait for any pending initialization
 
+  // Bigger RX buffer (default 256 B): an SMS arrives as a +CMT URC while loop() may be busy in a
+  // slow HTTPS call, and a long message plus other URCs would overflow the default buffer.
+  sim800l.setRxBufferSize(2048);
   sim800l.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(3000);  // SIM800L boot time after power-up
 
@@ -502,6 +505,26 @@ uint8_t hmac_key[32];
 int outbox_count = 0;
 unsigned long last_flush_attempt = 0;
 bool backend_online = false;
+
+// --- Wi-Fi supervision ---------------------------------------------------------------------
+// The SMS outbox only drains while Wi-Fi is up, so a dropped link used to leave received SMS
+// waiting until the core's own auto-reconnect (minutes) brought it back. Now the reason for every
+// disconnect is logged and, in station mode, a link that stays down is re-established by walking
+// the priority list again.
+static volatile bool wifi_disc_pending = false;
+static volatile uint8_t wifi_disc_reason = 0;
+static bool wifi_sta_mode = false;          // true once connected as a station (not AP fallback)
+static unsigned long wifi_down_since = 0;
+static unsigned long last_wifi_recover = 0;
+const unsigned long WIFI_RECOVER_AFTER_MS = 30000;   // link down this long before we act
+const unsigned long WIFI_RECOVER_EVERY_MS = 60000;   // minimum gap between recovery attempts
+
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifi_disc_reason = info.wifi_sta_disconnected.reason;
+    wifi_disc_pending = true;  // logged from loop(): addLog() is not safe from the event task
+  }
+}
 
 bool loadJson(const char* path, JsonDocument& doc) {
   File f = SPIFFS.open(path, "r");
@@ -1609,6 +1632,8 @@ void setupWiFiMode() {
   if (connectByPriority()) {
     Serial.printf("[WiFi] Connected to %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     addLog("WiFi", "Conectado!");
+    wifi_sta_mode = true;
+    WiFi.setSleep(false);  // modem power-save drops/delays packets (ping spikes, DNS timeouts)
 
     // DNS: use exactly what the network's DHCP server handed out. Do not override it with
     // public resolvers - some networks block outbound DNS to external servers (8.8.8.8 and
@@ -1677,6 +1702,7 @@ void setup() {
   loadConfig();
   initOutbox();
   esp_task_wdt_reset();
+  WiFi.onEvent(onWiFiEvent);
   setupWiFiMode();
   esp_task_wdt_reset();
   sim800l_init();
@@ -1698,6 +1724,28 @@ void loop() {
     signal_strength = getSignalStrength();
     last_signal_check = millis();
     Serial.printf("[Signal] Strength: %d%%\n", signal_strength);
+  }
+
+  if (wifi_disc_pending) {
+    wifi_disc_pending = false;
+    addLog("WiFi", (String("Desconectado (motivo ") + wifi_disc_reason + ")").c_str());
+  }
+  if (wifi_sta_mode) {
+    if (WiFi.isConnected()) {
+      wifi_down_since = 0;
+    } else {
+      if (wifi_down_since == 0) wifi_down_since = millis();
+      if (millis() - wifi_down_since > WIFI_RECOVER_AFTER_MS &&
+          millis() - last_wifi_recover > WIFI_RECOVER_EVERY_MS) {
+        last_wifi_recover = millis();
+        addLog("WiFi", "Sem Wi-Fi: a tentar recuperar");
+        if (connectByPriority()) {
+          WiFi.setSleep(false);
+          addLog("WiFi", (String("Wi-Fi recuperado: ") + WiFi.SSID()).c_str());
+          wifi_down_since = 0;
+        }
+      }
+    }
   }
 
   if (WiFi.isConnected()) {

@@ -3,6 +3,18 @@
 All notable changes to the ESP32 firmware (`esp/`) are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.3.1]
+
+### Fixed
+- Received SMS were forwarded to the backend minutes late when the Wi-Fi link dropped: the outbox
+  only drains while Wi-Fi is up, and recovery depended on the core's slow auto-reconnect. Now, in
+  station mode, a link that stays down for 30 s is re-established by walking the priority list
+  again (at most once a minute).
+- Every Wi-Fi disconnect is logged with its reason code, so drops can be diagnosed.
+- Wi-Fi modem power-save is turned off after connecting; it caused latency spikes and DNS timeouts.
+- Modem UART RX buffer raised from 256 B to 2 KB, so an SMS arriving while loop() is busy in a slow
+  HTTPS call is not truncated.
+
 ## [1.3.0]
 
 ### Added
