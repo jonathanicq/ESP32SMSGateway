@@ -66,10 +66,16 @@ struct LogEntry {
   char message[256];
 };
 
+// Wi-Fi networks, tried in priority order (index 0 = highest priority).
+#define MAX_WIFI_NETWORKS 5
+struct WifiNetwork {
+  char ssid[64];
+  char password[128];
+};
+
 // Configuration storage
 struct Config {
-  char wifi_ssid[64];
-  char wifi_password[128];
+  WifiNetwork wifi_nets[MAX_WIFI_NETWORKS];
   char api_url[256];
   char api_key[128];
   char whatsapp_number[32];
@@ -92,7 +98,7 @@ int log_count = 0;
 WebServer server(80);
 const char* AP_SSID = "SIM800L-Gateway";
 const char* AP_PASSWORD = "12345678";
-const char* FIRMWARE_VERSION = "v1.2.0";
+const char* FIRMWARE_VERSION = "v1.3.1";
 
 volatile bool sms_received = false;
 String last_sms_sender;
@@ -187,8 +193,6 @@ void loadConfig() {
   File file = SPIFFS.open("/config.json", "r");
   if (!file) {
     memset(&config, 0, sizeof(config));
-    strcpy(config.wifi_ssid, "");
-    strcpy(config.wifi_password, "");
     strcpy(config.api_url, "https://sms-gateway.thecoordinates.app/api");
     strcpy(config.api_key, "");
     strcpy(config.whatsapp_number, "");
@@ -207,8 +211,24 @@ void loadConfig() {
   deserializeJson(doc, file);
   file.close();
 
-  strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
-  strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
+  // Priority list; configs saved by older firmware only have wifi_ssid/wifi_password,
+  // which become the single (highest-priority) network.
+  memset(config.wifi_nets, 0, sizeof(config.wifi_nets));
+  JsonArray nets = doc["wifi_networks"].as<JsonArray>();
+  if (!nets.isNull()) {
+    int n = 0;
+    for (JsonObject o : nets) {
+      if (n >= MAX_WIFI_NETWORKS) break;
+      const char* s = o["ssid"] | "";
+      if (!s[0]) continue;
+      strlcpy(config.wifi_nets[n].ssid, s, sizeof(config.wifi_nets[n].ssid));
+      strlcpy(config.wifi_nets[n].password, o["password"] | "", sizeof(config.wifi_nets[n].password));
+      n++;
+    }
+  } else {
+    strlcpy(config.wifi_nets[0].ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_nets[0].ssid));
+    strlcpy(config.wifi_nets[0].password, doc["wifi_password"] | "", sizeof(config.wifi_nets[0].password));
+  }
   strlcpy(config.api_url, doc["api_url"] | "https://sms-gateway.thecoordinates.app/api", sizeof(config.api_url));
   strlcpy(config.api_key, doc["api_key"] | "", sizeof(config.api_key));
   strlcpy(config.whatsapp_number, doc["whatsapp_number"] | "", sizeof(config.whatsapp_number));
@@ -250,8 +270,16 @@ void loadConfig() {
 
 void saveConfig() {
   JsonDocument doc;
-  doc["wifi_ssid"] = config.wifi_ssid;
-  doc["wifi_password"] = config.wifi_password;
+  JsonArray nets = doc["wifi_networks"].to<JsonArray>();
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    if (!config.wifi_nets[i].ssid[0]) continue;
+    JsonObject o = nets.add<JsonObject>();
+    o["ssid"] = config.wifi_nets[i].ssid;
+    o["password"] = config.wifi_nets[i].password;
+  }
+  // Highest-priority network also under the legacy keys, so a downgrade keeps working.
+  doc["wifi_ssid"] = config.wifi_nets[0].ssid;
+  doc["wifi_password"] = config.wifi_nets[0].password;
   doc["api_url"] = config.api_url;
   doc["api_key"] = config.api_key;
   doc["whatsapp_number"] = config.whatsapp_number;
@@ -335,6 +363,9 @@ void sim800l_init() {
   sim800l_powerOn();
   delay(3000);  // Wait for any pending initialization
 
+  // Bigger RX buffer (default 256 B): an SMS arrives as a +CMT URC while loop() may be busy in a
+  // slow HTTPS call, and a long message plus other URCs would overflow the default buffer.
+  sim800l.setRxBufferSize(2048);
   sim800l.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(3000);  // SIM800L boot time after power-up
 
@@ -474,6 +505,26 @@ uint8_t hmac_key[32];
 int outbox_count = 0;
 unsigned long last_flush_attempt = 0;
 bool backend_online = false;
+
+// --- Wi-Fi supervision ---------------------------------------------------------------------
+// The SMS outbox only drains while Wi-Fi is up, so a dropped link used to leave received SMS
+// waiting until the core's own auto-reconnect (minutes) brought it back. Now the reason for every
+// disconnect is logged and, in station mode, a link that stays down is re-established by walking
+// the priority list again.
+static volatile bool wifi_disc_pending = false;
+static volatile uint8_t wifi_disc_reason = 0;
+static bool wifi_sta_mode = false;          // true once connected as a station (not AP fallback)
+static unsigned long wifi_down_since = 0;
+static unsigned long last_wifi_recover = 0;
+const unsigned long WIFI_RECOVER_AFTER_MS = 30000;   // link down this long before we act
+const unsigned long WIFI_RECOVER_EVERY_MS = 60000;   // minimum gap between recovery attempts
+
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifi_disc_reason = info.wifi_sta_disconnected.reason;
+    wifi_disc_pending = true;  // logged from loop(): addLog() is not safe from the event task
+  }
+}
 
 bool loadJson(const char* path, JsonDocument& doc) {
   File f = SPIFFS.open(path, "r");
@@ -1002,8 +1053,13 @@ static bool isMaskedValue(JsonVariantConst v) {
 
 void handleGetConfig() {
   JsonDocument doc;
-  doc["wifi_ssid"] = config.wifi_ssid;
-  doc["wifi_password"] = maskSecret(config.wifi_password);
+  JsonArray nets = doc["wifi_networks"].to<JsonArray>();
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    if (!config.wifi_nets[i].ssid[0]) continue;
+    JsonObject o = nets.add<JsonObject>();
+    o["ssid"] = config.wifi_nets[i].ssid;
+    o["password"] = maskSecret(config.wifi_nets[i].password);
+  }
   doc["api_url"] = config.api_url;
   doc["api_key"] = maskSecret(config.api_key);
   doc["whatsapp_number"] = config.whatsapp_number;
@@ -1080,11 +1136,39 @@ void handlePostConfig() {
   JsonDocument doc;
   deserializeJson(doc, server.arg("plain"));
 
-  if (!doc["wifi_ssid"].isNull()) {
-    strlcpy(config.wifi_ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_ssid));
-  }
-  if (!doc["wifi_password"].isNull() && !isMaskedValue(doc["wifi_password"])) {
-    strlcpy(config.wifi_password, doc["wifi_password"] | "", sizeof(config.wifi_password));
+  if (doc["wifi_networks"].is<JsonArray>()) {
+    // The posted list replaces the stored one, in the posted order (= priority).
+    // A masked password means "keep the stored one for this SSID".
+    WifiNetwork old[MAX_WIFI_NETWORKS];
+    memcpy(old, config.wifi_nets, sizeof(old));
+    memset(config.wifi_nets, 0, sizeof(config.wifi_nets));
+    int n = 0;
+    for (JsonObject o : doc["wifi_networks"].as<JsonArray>()) {
+      if (n >= MAX_WIFI_NETWORKS) break;
+      const char* s = o["ssid"] | "";
+      if (!s[0]) continue;
+      bool dup = false;
+      for (int j = 0; j < n; j++) if (strcmp(config.wifi_nets[j].ssid, s) == 0) dup = true;
+      if (dup) continue;
+      strlcpy(config.wifi_nets[n].ssid, s, sizeof(config.wifi_nets[n].ssid));
+      if (isMaskedValue(o["password"])) {
+        for (int j = 0; j < MAX_WIFI_NETWORKS; j++) {
+          if (strcmp(old[j].ssid, s) == 0) {
+            strlcpy(config.wifi_nets[n].password, old[j].password, sizeof(config.wifi_nets[n].password));
+            break;
+          }
+        }
+      } else {
+        strlcpy(config.wifi_nets[n].password, o["password"] | "", sizeof(config.wifi_nets[n].password));
+      }
+      n++;
+    }
+  } else if (!doc["wifi_ssid"].isNull()) {
+    // Legacy single-network form: sets the highest-priority network.
+    strlcpy(config.wifi_nets[0].ssid, doc["wifi_ssid"] | "", sizeof(config.wifi_nets[0].ssid));
+    if (!doc["wifi_password"].isNull() && !isMaskedValue(doc["wifi_password"])) {
+      strlcpy(config.wifi_nets[0].password, doc["wifi_password"] | "", sizeof(config.wifi_nets[0].password));
+    }
   }
   if (!doc["api_url"].isNull()) {
     strlcpy(config.api_url, doc["api_url"] | "", sizeof(config.api_url));
@@ -1181,6 +1265,84 @@ void handlePostBackendTest() {
   handleGetBackendStatus();
 }
 
+// --- GSM diagnostics (read-only) ---
+// Sends one AT query to the modem and returns its reply on a single line.
+static String gsmQuery(const char* cmd, uint32_t timeoutMs = 2000) {
+  modem.sendAT(cmd);
+  String r;
+  modem.waitResponse(timeoutMs, r);
+  r.replace("\r", " ");
+  r.replace("\n", " ");
+  r.trim();
+  return r;
+}
+
+static const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "poweron";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "int_watchdog";
+    case ESP_RST_TASK_WDT:  return "task_watchdog";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    default:                return "other";
+  }
+}
+
+// GET /api/gsm/status: raw modem state, to tell a bad reading from a real "no signal"
+// (modem not registered) from a power problem (low/unstable supply voltage, brownout resets).
+// Contains no secrets: no SIM number, no message content, no keys.
+void handleGetGsmStatus() {
+  JsonDocument doc;
+
+  String csq = gsmQuery("+CSQ");
+  String creg = gsmQuery("+CREG?");
+  String cgreg = gsmQuery("+CGREG?");
+  String cops = gsmQuery("+COPS?");
+  String cbc = gsmQuery("+CBC");
+
+  doc["csq_raw"] = csq;
+  doc["creg_raw"] = creg;
+  doc["cgreg_raw"] = cgreg;
+  doc["cops_raw"] = cops;
+  doc["cbc_raw"] = cbc;
+
+  // +CSQ: <rssi 0-31, 99 = unknown>,<ber>
+  int rssi = -1;
+  int p = csq.indexOf("+CSQ:");
+  if (p >= 0) sscanf(csq.c_str() + p + 5, " %d", &rssi);
+  doc["csq"] = rssi;
+  doc["csq_ok"] = rssi >= 1 && rssi <= 31;
+
+  // +CREG: <n>,<stat>  (stat 1 = home network, 5 = roaming, 2 = searching, 3 = denied, 0 = not registered)
+  int n = -1, stat = -1;
+  p = creg.indexOf("+CREG:");
+  if (p >= 0) sscanf(creg.c_str() + p + 6, " %d,%d", &n, &stat);
+  doc["creg_stat"] = stat;
+  doc["registered"] = (stat == 1 || stat == 5);
+
+  // +CBC: <charge state>,<percent>,<supply voltage in mV>
+  int chg = -1, pct = -1, mv = -1;
+  p = cbc.indexOf("+CBC:");
+  if (p >= 0) sscanf(cbc.c_str() + p + 5, " %d,%d,%d", &chg, &pct, &mv);
+  doc["supply_mv"] = mv;
+  // SIM800L needs about 3.4 V or more at its supply, with current peaks up to 2 A.
+  doc["supply_low"] = (mv > 0 && mv < 3500);
+
+  doc["signal_percent"] = signal_strength;  // value shown in the portal bar
+  doc["uptime_s"] = (uint32_t)(millis() / 1000);
+  doc["reset_reason"] = resetReasonName();  // "brownout" = supply voltage dipped
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["free_heap"] = ESP.getFreeHeap();
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 void handleNotFound() {
   // Everything except the page itself requires the portal password (Basic auth, user "admin").
   // The password is the existing AP password, so no password is added or removed.
@@ -1193,6 +1355,9 @@ void handleNotFound() {
     return;
   } else if (server.method() == HTTP_GET && server.uri() == "/api/backend/status") {
     handleGetBackendStatus();
+    return;
+  } else if (server.method() == HTTP_GET && server.uri() == "/api/gsm/status") {
+    handleGetGsmStatus();
     return;
   } else if (server.method() == HTTP_POST && server.uri() == "/api/backend/test") {
     handlePostBackendTest();
@@ -1402,45 +1567,94 @@ void setupAPMode() {
   setupOTA();
 }
 
+// Tries one network for up to maxAttempts*0.5 s (default ~10 s). Feeds the watchdog while waiting, since
+// several networks in a row can take longer than a single wait.
+static bool tryConnectWiFi(const char* ssid, const char* password, int maxAttempts = 20) {
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.printf("[WiFi] Connecting to %s...\n", ssid);
+  addLog("WiFi", (String("Conectando a ") + ssid + "...").c_str());
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+    delay(500);
+    Serial.print(".");
+    esp_task_wdt_reset();
+    attempts++;
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Walks the configured networks in priority order and stops at the first that connects.
+// One scan first, only to size the timeout: a network seen in the scan gets the full ~10 s,
+// one that was not seen gets ~4 s. It is never skipped, because a single ESP32 scan can miss
+// networks (hidden SSIDs, busy channels) that still connect fine. If none is seen at all,
+// every network gets the full timeout.
+static bool connectByPriority() {
+  bool seen[MAX_WIFI_NETWORKS] = {};
+  bool anySeen = false;
+  WiFi.mode(WIFI_STA);
+  int found = WiFi.scanNetworks();
+  for (int i = 0; i < found; i++) {
+    String s = WiFi.SSID(i);
+    for (int j = 0; j < MAX_WIFI_NETWORKS; j++) {
+      if (config.wifi_nets[j].ssid[0] && s == config.wifi_nets[j].ssid) {
+        seen[j] = true;
+        anySeen = true;
+      }
+    }
+  }
+  WiFi.scanDelete();
+  esp_task_wdt_reset();
+  Serial.printf("[WiFi] Scan: %d networks, %s of the configured ones in range\n", found,
+                anySeen ? "some" : "none");
+
+  for (int i = 0; i < MAX_WIFI_NETWORKS; i++) {
+    if (!config.wifi_nets[i].ssid[0]) continue;
+    int attempts = (anySeen && !seen[i]) ? 8 : 20;
+    if (tryConnectWiFi(config.wifi_nets[i].ssid, config.wifi_nets[i].password, attempts)) {
+      addLog("WiFi", (String("Rede ") + (i + 1) + " (prioridade): " + config.wifi_nets[i].ssid).c_str());
+      return true;
+    }
+  }
+  return false;
+}
+
 void setupWiFiMode() {
-  if (!config.wifi_ssid[0]) {
+  if (!config.wifi_nets[0].ssid[0]) {
     setupAPMode();
     return;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(config.wifi_ssid, config.wifi_password);
-
-  Serial.printf("[WiFi] Connecting to %s...\n", config.wifi_ssid);
-  addLog("WiFi", "Conectando...");
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+  if (connectByPriority()) {
+    Serial.printf("[WiFi] Connected to %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
     addLog("WiFi", "Conectado!");
+    wifi_sta_mode = true;
+    WiFi.setSleep(false);  // modem power-save drops/delays packets (ping spikes, DNS timeouts)
 
-    // Re-apply the SAME DHCP-assigned IP/gateway/subnet but force public DNS
-    // resolvers. WiFi.config() needs a real (non-zero) local_ip to succeed on
-    // this core - passing INADDR_NONE to "keep DHCP, only override DNS"
-    // silently fails the whole call (including the DNS part), so this reuses
-    // whatever address DHCP just handed out instead of a hardcoded one, which
-    // keeps this working on any network the device is configured to join.
-    // Needed because some routers hand out a DNS server (e.g. OpenDNS) that
-    // refuses to resolve arbitrary domains for unregistered networks.
-    WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(),
-                IPAddress(8, 8, 8, 8), IPAddress(1, 1, 1, 1));
-    Serial.printf("[WiFi] DNS1: %s  DNS2: %s\n",
+    // DNS: use exactly what the network's DHCP server handed out. Do not override it with
+    // public resolvers - some networks block outbound DNS to external servers (8.8.8.8 and
+    // 1.1.1.1 time out there), which silently broke name resolution for NTP and the backend.
+    Serial.printf("[WiFi] DNS (DHCP) 1: %s  2: %s\n",
                   WiFi.dnsIP(0).toString().c_str(), WiFi.dnsIP(1).toString().c_str());
 
+    // Probe the host the gateway actually needs (the backend), not an unrelated domain.
+    String probeHost = String(config.api_url);
+    int schemeEnd = probeHost.indexOf("://");
+    if (schemeEnd >= 0) probeHost = probeHost.substring(schemeEnd + 3);
+    int slash = probeHost.indexOf('/');
+    if (slash >= 0) probeHost = probeHost.substring(0, slash);
+    if (probeHost.isEmpty()) probeHost = "google.com";
+
     IPAddress probeIp;
-    bool probeOk = WiFi.hostByName("google.com", probeIp);
-    Serial.printf("[WiFi] DNS probe google.com -> %s\n",
+    bool probeOk = WiFi.hostByName(probeHost.c_str(), probeIp);
+    Serial.printf("[WiFi] DNS probe %s -> %s\n", probeHost.c_str(),
                   probeOk ? probeIp.toString().c_str() : "FAILED");
+    if (!probeOk) addLog("WiFi", (String("DNS nao resolve ") + probeHost).c_str());
+    esp_task_wdt_reset();
 
     configTzTime("WET0WEST,M3.5.0/1,M10.5.0", "pool.ntp.org", "time.google.com");  // log timestamps
     autoConfigureAPN();
@@ -1448,7 +1662,7 @@ void setupWiFiMode() {
     server.begin();
     setupOTA();
   } else {
-    Serial.println("\n[WiFi] Failed to connect, entering AP mode");
+    Serial.println("[WiFi] Failed to connect to any network, entering AP mode");
     addLog("WiFi", "Falha na conexao, entrando em modo AP");
     setupAPMode();
   }
@@ -1488,6 +1702,7 @@ void setup() {
   loadConfig();
   initOutbox();
   esp_task_wdt_reset();
+  WiFi.onEvent(onWiFiEvent);
   setupWiFiMode();
   esp_task_wdt_reset();
   sim800l_init();
@@ -1509,6 +1724,28 @@ void loop() {
     signal_strength = getSignalStrength();
     last_signal_check = millis();
     Serial.printf("[Signal] Strength: %d%%\n", signal_strength);
+  }
+
+  if (wifi_disc_pending) {
+    wifi_disc_pending = false;
+    addLog("WiFi", (String("Desconectado (motivo ") + wifi_disc_reason + ")").c_str());
+  }
+  if (wifi_sta_mode) {
+    if (WiFi.isConnected()) {
+      wifi_down_since = 0;
+    } else {
+      if (wifi_down_since == 0) wifi_down_since = millis();
+      if (millis() - wifi_down_since > WIFI_RECOVER_AFTER_MS &&
+          millis() - last_wifi_recover > WIFI_RECOVER_EVERY_MS) {
+        last_wifi_recover = millis();
+        addLog("WiFi", "Sem Wi-Fi: a tentar recuperar");
+        if (connectByPriority()) {
+          WiFi.setSleep(false);
+          addLog("WiFi", (String("Wi-Fi recuperado: ") + WiFi.SSID()).c_str());
+          wifi_down_since = 0;
+        }
+      }
+    }
   }
 
   if (WiFi.isConnected()) {
